@@ -71,9 +71,88 @@ Root.prototype.resolvePath = util.path.resolve;
  */
 Root.prototype.fetch = util.fetch;
 
-// A symbol-like function to safely signal synchronous loading
-/* istanbul ignore next */
-function SYNC() {} // eslint-disable-line no-empty-function
+// If a bundled file exists, return its canonical name
+function getBundledFileName(filename) {
+    var idx = filename.lastIndexOf("google/protobuf/");
+    if (idx > -1) {
+        var altname = filename.substring(idx);
+        if (altname in common) return altname;
+    }
+    return null;
+}
+
+// Fetch a bundled definition
+function getBundled(filename) {
+    filename = getBundledFileName(filename) || filename;
+    if (filename in common) {
+        return common[filename];
+    }
+    return undefined;
+}
+
+// Processes a single file synchronously, returning the next set of files to load
+function processSingleFile(self, filename, source, options) {
+    if (util.isString(source) && source.charAt(0) === "{")
+        source = JSON.parse(source);
+    if (!util.isString(source)) {
+        self.setOptions(source.options).addJSON(source.nested);
+        return [];
+    } else {
+        parse.filename = filename;
+        var parsed = parse(source, self, options);
+        var nextResolvedImports = [];
+        if (parsed.imports) {
+            for (var i = 0; i < parsed.imports.length; i++) {
+                var nextResolvedFilename = getBundledFileName(parsed.imports[i]) || self.resolvePath(filename, parsed.imports[i]);
+                if (nextResolvedFilename !== null)
+                    nextResolvedImports.push({ filename: nextResolvedFilename, weak: false });
+            }
+        }
+        if (parsed.weakImports) {
+            for (var i = 0; i < parsed.weakImports.length; i++) {
+                var nextResolvedFilename = getBundledFileName(parsed.weakImports[i]) || self.resolvePath(filename, parsed.weakImports[i]);
+                if (nextResolvedFilename !== null)
+                    nextResolvedImports.push({ filename: nextResolvedFilename, weak: true });
+            }
+        }
+        return nextResolvedImports;
+    }
+}
+
+function fetchSingleFileSync(self, filename) {
+    // Skip if already loaded / attempted
+    if (self.files.indexOf(filename) > -1)
+        return undefined;
+    self.files.push(filename);
+
+    // Load bundled package
+    var bundled = getBundled(filename)
+    if (bundled) return bundled;
+
+    // Load from disk
+    return util.fs.readFileSync(filename).toString("utf8");
+}
+
+function fetchSingleFileAsync(self, filename, cb) {
+    // Skip if already loaded / attempted
+    if (self.files.indexOf(filename) > -1) {
+        setTimeout(cb, 0, null, undefined);
+        return; 
+    }
+    self.files.push(filename);
+
+    // Load bundled package
+    var bundled = getBundled(filename)
+    if (bundled) {
+        setTimeout(cb, 0, null, bundled);
+        return;
+    }
+
+    // Load from disk or network
+    self.fetch(filename, function (err, source) {
+        cb(err, source);
+    });
+}
 
 /**
  * Loads one or multiple .proto or preprocessed .json files into this root namespace and calls the callback.
@@ -91,126 +170,69 @@ Root.prototype.load = function load(filename, options, callback) {
     if (!callback)
         return util.asPromise(load, self, filename, options);
 
-    var sync = callback === SYNC; // undocumented
-
     // Finishes loading by calling the callback (exactly once)
-    function finish(err, root) {
-        /* istanbul ignore if */
-        if (!callback)
-            return;
-        if (sync)
-            throw err;
-        var cb = callback;
-        callback = null;
-        cb(err, root);
+    var requestsInFlight = 0;
+    var callbackCalled = false;
+    function finish(err) {
+        if (callbackCalled) return;
+
+        if (err) {
+            callbackCalled = true;
+            callback(err, null);
+        } else if (requestsInFlight === 0) {
+            callbackCalled = true;
+            callback(null, self);
+        }
     }
 
-    // Bundled definition existence checking
-    function getBundledFileName(filename) {
-        var idx = filename.lastIndexOf("google/protobuf/");
-        if (idx > -1) {
-            var altname = filename.substring(idx);
-            if (altname in common) return altname;
-        }
-        return null;
-    }
+    function handleOneFile(resolvedFilename, weak) {
+        // Load file
+        requestsInFlight++;
+        fetchSingleFileAsync(self, resolvedFilename, (err, source) => {
+            requestsInFlight--;
 
-    // Processes a single file
-    function process(filename, source) {
-        try {
-            if (util.isString(source) && source.charAt(0) === "{")
-                source = JSON.parse(source);
-            if (!util.isString(source))
-                self.setOptions(source.options).addJSON(source.nested);
-            else {
-                parse.filename = filename;
-                var parsed = parse(source, self, options),
-                    resolved,
-                    i = 0;
-                if (parsed.imports)
-                    for (; i < parsed.imports.length; ++i)
-                        if (resolved = getBundledFileName(parsed.imports[i]) || self.resolvePath(filename, parsed.imports[i]))
-                            fetch(resolved);
-                if (parsed.weakImports)
-                    for (i = 0; i < parsed.weakImports.length; ++i)
-                        if (resolved = getBundledFileName(parsed.weakImports[i]) || self.resolvePath(filename, parsed.weakImports[i]))
-                            fetch(resolved, true);
-            }
-        } catch (err) {
-            finish(err);
-        }
-        if (!sync && !queued)
-            finish(null, self); // only once anyway
-    }
-
-    // Fetches a single file
-    function fetch(filename, weak) {
-        filename = getBundledFileName(filename) || filename;
-
-        // Skip if already loaded / attempted
-        if (self.files.indexOf(filename) > -1)
-            return;
-        self.files.push(filename);
-
-        // Shortcut bundled definitions
-        if (filename in common) {
-            if (sync)
-                process(filename, common[filename]);
-            else {
-                ++queued;
-                setTimeout(function() {
-                    --queued;
-                    process(filename, common[filename]);
-                });
-            }
-            return;
-        }
-
-        // Otherwise fetch from disk or network
-        if (sync) {
-            var source;
-            try {
-                source = util.fs.readFileSync(filename).toString("utf8");
-            } catch (err) {
-                if (!weak)
-                    finish(err);
+            // Stop immediently if something fails to fetch
+            if (!weak && err) {
+                finish(err);
                 return;
             }
-            process(filename, source);
-        } else {
-            ++queued;
-            self.fetch(filename, function(err, source) {
-                --queued;
-                /* istanbul ignore if */
-                if (!callback)
-                    return; // terminated meanwhile
-                if (err) {
-                    /* istanbul ignore else */
-                    if (!weak)
-                        finish(err);
-                    else if (!queued) // can't be covered reliably
-                        finish(null, self);
-                    return;
-                }
-                process(filename, source);
-            });
-        }
-    }
-    var queued = 0;
 
-    // Assembling the root namespace doesn't require working type
-    // references anymore, so we can load everything in parallel
+            if (source) {
+                var nextResolvedImports;
+                try {
+                    nextResolvedImports = processSingleFile(self, resolvedFilename, source, options);
+                } catch (err) {
+                    // Stop immediently if something fails to parse
+                    if (!weak) {
+                        finish(err);
+                        return;
+                    }
+                }
+
+                // Dispatch imports recursively
+                for (var i = 0; i < nextResolvedImports.length; i++) {
+                    var importItem = nextResolvedImports[i];
+                    handleOneFile(importItem.filename, importItem.weak);
+                }
+            }
+
+            // If all the imports are processed and all the inflight requests are done, then the callback will be called
+            finish(null);
+        });
+    }
+
     if (util.isString(filename))
         filename = [ filename ];
-    for (var i = 0, resolved; i < filename.length; ++i)
-        if (resolved = self.resolvePath("", filename[i]))
-            fetch(resolved);
 
-    if (sync)
-        return self;
-    if (!queued)
-        finish(null, self);
-    return undefined;
+    // Resolve and fetch initial files
+    for (var i = 0; i < filename.length; ++i) {
+        const resolvedFilename = getBundledFileName(filename[i]) || self.resolvePath("", filename[i]);
+        if (resolvedFilename !== null)
+            handleOneFile(resolvedFilename, false);
+    }
+
+    // Call the callback immediently if there is nothing to load
+    finish(null);
 };
 // function load(filename:string, options:IParseOptions, callback:LoadCallback):undefined
 
@@ -245,7 +267,39 @@ Root.prototype.load = function load(filename, options, callback) {
 Root.prototype.loadSync = function loadSync(filename, options) {
     if (!util.isNode)
         throw Error("not supported");
-    return this.load(filename, options, SYNC);
+
+    var self = this;
+    var filename = util.isString(filename) ? [filename] : filename;
+    var stack = [];
+
+    // Resolve initial files and append to stack (backwards)
+    var i = filename.length;
+    while (i--) {
+        const resolvedFilename = getBundledFileName(filename[i]) || self.resolvePath("", filename[i]);
+        if (resolvedFilename !== null)
+            stack.push({ filename: resolvedFilename, weak: false });
+    }
+
+    while (stack.length) {
+        var stackTop = stack.pop();
+
+        // Load file
+        var source;
+        try {
+            source = fetchSingleFileSync(self, stackTop.filename);
+        } catch (err) {
+            if (stackTop.weak) continue;
+            else throw err;
+        }
+        var nextResolvedImports = processSingleFile(self, stackTop.filename, source, options);
+
+        // Append imports to stack (backwards)
+        var i = nextResolvedImports.length;
+        while (i--)
+            stack.push(nextResolvedImports[i]);
+    }
+
+    return self;
 };
 
 /**
