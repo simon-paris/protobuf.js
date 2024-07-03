@@ -97,26 +97,28 @@ function processSingleFile(self, filename, source, options) {
     if (!util.isString(source)) {
         self.setOptions(source.options).addJSON(source.nested);
         return [];
-    } else {
-        parse.filename = filename;
-        var parsed = parse(source, self, options);
-        var nextResolvedImports = [];
-        if (parsed.imports) {
-            for (var i = 0; i < parsed.imports.length; i++) {
-                var nextResolvedFilename = getBundledFileName(parsed.imports[i]) || self.resolvePath(filename, parsed.imports[i]);
-                if (nextResolvedFilename !== null)
-                    nextResolvedImports.push({ filename: nextResolvedFilename, weak: false });
-            }
-        }
-        if (parsed.weakImports) {
-            for (var i = 0; i < parsed.weakImports.length; i++) {
-                var nextResolvedFilename = getBundledFileName(parsed.weakImports[i]) || self.resolvePath(filename, parsed.weakImports[i]);
-                if (nextResolvedFilename !== null)
-                    nextResolvedImports.push({ filename: nextResolvedFilename, weak: true });
-            }
-        }
-        return nextResolvedImports;
     }
+
+    parse.filename = filename;
+    var parsed = parse(source, self, options),
+        nextResolvedImports = [],
+        nextResolvedFilename,
+        i;
+    if (parsed.imports) {
+        for (i = 0; i < parsed.imports.length; i++) {
+            nextResolvedFilename = getBundledFileName(parsed.imports[i]) || self.resolvePath(filename, parsed.imports[i]);
+            if (nextResolvedFilename !== null)
+                nextResolvedImports.push({ filename: nextResolvedFilename, weak: false });
+        }
+    }
+    if (parsed.weakImports) {
+        for (i = 0; i < parsed.weakImports.length; i++) {
+            nextResolvedFilename = getBundledFileName(parsed.weakImports[i]) || self.resolvePath(filename, parsed.weakImports[i]);
+            if (nextResolvedFilename !== null)
+                nextResolvedImports.push({ filename: nextResolvedFilename, weak: true });
+        }
+    }
+    return nextResolvedImports;
 }
 
 function fetchSingleFileSync(self, filename) {
@@ -126,7 +128,7 @@ function fetchSingleFileSync(self, filename) {
     self.files.push(filename);
 
     // Load bundled package
-    var bundled = getBundled(filename)
+    var bundled = getBundled(filename);
     if (bundled) return bundled;
 
     // Load from disk
@@ -137,12 +139,12 @@ function fetchSingleFileAsync(self, filename, cb) {
     // Skip if already loaded / attempted
     if (self.files.indexOf(filename) > -1) {
         setTimeout(cb, 0, null, undefined);
-        return; 
+        return;
     }
     self.files.push(filename);
 
     // Load bundled package
-    var bundled = getBundled(filename)
+    var bundled = getBundled(filename);
     if (bundled) {
         setTimeout(cb, 0, null, bundled);
         return;
@@ -174,15 +176,15 @@ Root.prototype.load = function load(filename, options, callback) {
     var requestsInFlight = 0;
     var callbackCalled = false;
     function finish(err) {
-        if (callbackCalled) return;
-
+        if (callbackCalled) return undefined;
         if (err) {
             callbackCalled = true;
-            callback(err, null);
+            return callback(err, null);
         } else if (requestsInFlight === 0) {
             callbackCalled = true;
-            callback(null, self);
+            return callback(null, self);
         }
+        return undefined;
     }
 
     function handleOneFile(resolvedFilename, weak) {
@@ -233,6 +235,7 @@ Root.prototype.load = function load(filename, options, callback) {
 
     // Call the callback immediently if there is nothing to load
     finish(null);
+    return undefined;
 };
 // function load(filename:string, options:IParseOptions, callback:LoadCallback):undefined
 
@@ -268,9 +271,9 @@ Root.prototype.loadSync = function loadSync(filename, options) {
     if (!util.isNode)
         throw Error("not supported");
 
-    var self = this;
-    var filename = util.isString(filename) ? [filename] : filename;
-    var stack = [];
+    var self = this,
+        stack = [];
+    filename = util.isString(filename) ? [filename] : filename;
 
     // Resolve initial files and append to stack (backwards)
     var i = filename.length;
@@ -294,9 +297,9 @@ Root.prototype.loadSync = function loadSync(filename, options) {
         var nextResolvedImports = processSingleFile(self, stackTop.filename, source, options);
 
         // Append imports to stack (backwards)
-        var i = nextResolvedImports.length;
-        while (i--)
-            stack.push(nextResolvedImports[i]);
+        var j = nextResolvedImports.length;
+        while (j--)
+            stack.push(nextResolvedImports[j]);
     }
 
     return self;
