@@ -14,7 +14,8 @@ function missing(field) {
 }
 
 function tag(fieldId, wireType) {
-    return fieldId << 3 | wireType;
+    // Use math here, not bitwise ops, the output can be bigger than 32 bits
+    return (fieldId * 8) + wireType;
 }
 
 /**
@@ -27,9 +28,15 @@ function decoder(mtype) {
     var gen = util.codegen(["r", "l"], mtype.name + "$decode")
     ("if(!(r instanceof Reader))")
         ("r=Reader.create(r)")
-    ("var c=l===undefined?r.len:r.pos+l,m=new this.ctor" + (mtype.fieldsArray.filter(function(field) { return field.map; }).length ? ",k,value" : ""))
+
+    ("var c=l===undefined?r.len:r.pos+l,") // Max offset
+        ("c2=0,") // Inner max offset
+        ("t=0,t2=0,") // Tag, inner tag
+        ("k,v,") // Key, value temps for maps
+        ("m=new this.ctor") // Message instance
+
     ("while(r.pos<c){")
-        ("var t=r.uint32()");
+        ("t=r.uint32()");
 
     if (mtype.group) {
         gen
@@ -37,7 +44,7 @@ function decoder(mtype) {
     }
 
     gen
-        ("debugger;switch(t){");
+        ("switch(t){");
 
     var i = 0;
     for (; i < /* initializes */ mtype.fieldsArray.length; ++i) {
@@ -59,23 +66,23 @@ function decoder(mtype) {
             ("case %i: {", tag(field.id, LEN_TYPE))
                 ("if(%s===util.emptyObject)", ref)
                     ("%s={}", ref) // Initialize empty map
-                ("var c2 = r.uint32()+r.pos") // Max offset
+                ("c2 = r.uint32()+r.pos")
                 ("k=%j", mapDefaultKey === undefined ? null : mapDefaultKey) // Key if key is missing
-                ("value=%j", defaultValue === undefined ? null : defaultValue) // Value if value is missing
+                ("v=%j", defaultValue === undefined ? null : defaultValue) // Value if value is missing
                 ("while(r.pos<c2){")
-                    ("var t2=r.uint32()")
+                    ("t2=r.uint32()")
                     ("switch(t2){")
                         ("case %i:", tag(1, mapKeyWireType))
                             ("k=r.%s()", mapKeyType)
                             ("break")
-                        ("case %i:", tag(2, basicWireType));
+                        ("case %i:", tag(2, basicWireType === undefined ? LEN_TYPE : basicWireType));
 
             if (basicWireType === undefined) {
                 gen
-                            ("value=types[%i].decode(r,r.uint32())", i); // can't be groups
+                            ("v=types[%i].decode(r,r.uint32())", i); // can't be groups
             } else {
                 gen
-                            ("value=r.%s()", type);
+                            ("v=r.%s()", type);
             }
 
             gen
@@ -85,20 +92,36 @@ function decoder(mtype) {
                             ("break")
                     ("}") // end inner switch
                 ("}") // end inner loop
-                ("%s", ref)(mapKeyLongWireType === undefined ? "k" : "typeof k===\"object\"?util.longToHash(k):k")("=value") // Assign k/v pair to map. Use a hash if the key type is a long.
+
+            // Assign k/v pair to map. Use a hash if the key type is a long.
+            if (mapKeyLongWireType === undefined) {
+                gen
+                ("%s[k]=v", ref)
+            } else {
+                gen
+                ("%s[typeof k===\"object\"?util.longToHash(k):k]=v", ref)
+            }
+
+            gen
                 ("break")
             ("}"); // end case
 
         } else if (field.repeated) {
-            if (basicWireType === undefined) {
+            if (group) {
+                // Repeated groups
+                gen
+                ("case %i: {", tag(field.id, SGROUP_TYPE))
+                    ("if(!(%s&&%s.length))%s=[]", ref, ref, ref)
+                    ("%s.push(types[%i].decode(r))", ref, i)
+                    ("break")
+                ("}");
+
+            } else if (basicWireType === undefined) {
                 // Repeated message fields
                 gen
-                ("case %i: {", tag(field.id, group ? SGROUP_TYPE : LEN_TYPE))
-                    ("if(!(%s&&%s.length))", ref, ref)
-                        ("%s=[]", ref)
-                    (group ?
-                        "%s.push(types[%i].decode(r))" :
-                        "%s.push(types[%i].decode(r,r.uint32()))", ref, i)
+                ("case %i: {", tag(field.id, LEN_TYPE))
+                    ("if(!(%s&&%s.length))%s=[]", ref, ref, ref)
+                    ("%s.push(types[%i].decode(r,r.uint32()))", ref, i)
                     ("break")
                 ("}");
 
@@ -106,8 +129,7 @@ function decoder(mtype) {
                 // Repeated primative fields
                 gen
                 ("case %i: {", tag(field.id, basicWireType))
-                    ("if(!(%s&&%s.length))", ref, ref)
-                        ("%s=[]", ref)
+                    ("if(!(%s&&%s.length))%s=[]", ref, ref, ref)
                     ("%s.push(r.%s())", ref, type)
                     ("break")
                 ("}");
@@ -117,9 +139,8 @@ function decoder(mtype) {
                 // Packed fields
                 gen
                 ("case %i: {", tag(field.id, LEN_TYPE))
-                    ("if(!(%s&&%s.length))", ref, ref)
-                        ("%s=[]", ref)
-                    ("var c2=r.uint32()+r.pos")
+                    ("if(!(%s&&%s.length))%s=[]", ref, ref, ref)
+                    ("c2=r.uint32()+r.pos")
                     ("while(r.pos<c2)")
                         ("%s.push(r.%s())", ref, type)
                     ("break")
@@ -127,7 +148,15 @@ function decoder(mtype) {
             }
 
         } else {
-            if (types.basic[type] === undefined) {
+            if (group) {
+                // Groups
+                gen
+                ("case %i: {", tag(field.id, SGROUP_TYPE))
+                    ("%s=types[%i].decode(r)", ref, i)
+                    ("break")
+                ("}");
+
+            } else if (types.basic[type] === undefined) {
                 // Message fields
                 gen
                 ("case %i: {", tag(field.id, group ? SGROUP_TYPE : LEN_TYPE))
