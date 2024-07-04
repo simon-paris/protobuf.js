@@ -156,6 +156,12 @@ function fetchSingleFileAsync(self, filename, cb) {
     });
 }
 
+// A symbol that means no action is required to import a file.
+// Either the file was already imported, or it's a weak import that failed.
+var IMPORT_NOOP = { IMPORT_NOOP: true };
+// A symbol that means an import is currently being fetched
+var IMPORT_IN_FLIGHT = { IMPORT_IN_FLIGHT: true };
+
 /**
  * Loads one or multiple .proto or preprocessed .json files into this root namespace and calls the callback.
  * @param {string|string[]} filename Names of one or multiple files to load
@@ -172,69 +178,93 @@ Root.prototype.load = function load(filename, options, callback) {
     if (!callback)
         return util.asPromise(load, self, filename, options);
 
-    // Finishes loading by calling the callback (exactly once)
-    var requestsInFlight = 0;
+    // Stack of work. The stack can contain:
+    // - objects containing { filename: string, source: string } (protobuf source, will be parsed)
+    // - the IMPORT_IN_FLIGHT symbol (means we need to stop and wait)
+    // - the IMPORT_NOOP symbol (file was already imported, or an error occurred but it can be ignored)
+    // - error objects (will be passed to the callback when it reaches the top of the stack)
+    var stack = [];
+
+    // Ensure the callback is only called once
     var callbackCalled = false;
     function finish(err) {
-        if (callbackCalled) return undefined;
-        if (err) {
-            callbackCalled = true;
-            return callback(err, null);
-        } else if (requestsInFlight === 0) {
-            callbackCalled = true;
-            return callback(null, self);
-        }
-        return undefined;
+        if (callbackCalled) return;
+        callbackCalled = true;
+        callback(err, err ? null : self);
     }
 
-    function handleOneFile(resolvedFilename, weak) {
-        // Load file
-        requestsInFlight++;
-        fetchSingleFileAsync(self, resolvedFilename, (err, source) => {
-            requestsInFlight--;
+    // Reserve a slot in the stack, and asynchronously populate it. Then call doParseWork to drain available work.
+    function fetchOneFile(resolvedFilename, weak) {
+        var slot = stack.length;
+        stack.push(IMPORT_IN_FLIGHT);
 
-            // Stop immediently if something fails to fetch
-            if (!weak && err) {
+        // Load file
+        fetchSingleFileAsync(self, resolvedFilename, (err, source) => {
+            if (err) {
+                // Failed to import
+                stack[slot] = weak ? IMPORT_NOOP : err;
+            } else if (source === undefined) {
+                // File already imported
+                stack[slot] = IMPORT_NOOP;
+            } else {
+                stack[slot] = { filename: resolvedFilename, source };
+            }
+            doParseWork();
+        });
+    }
+
+    // Parse sources at the top of the stack until the stack is empty or until we need to stop and wait for an async fetch.
+    function doParseWork() {
+        if (callbackCalled) return; // Avoid parsing anything new after the callback was called.
+
+        while (stack.length) {
+            var stackTop = stack.pop();
+            if (stackTop === IMPORT_IN_FLIGHT) {
+                stack.push(stackTop); // Not ready, put it back on stack
+                return;
+            }
+            if (stackTop === IMPORT_NOOP)
+                continue; // Import is ok, but nothing to do
+            if (stackTop instanceof Error) {
+                finish(stackTop); // Import is an error
+                return;
+            }
+
+            var nextResolvedImports;
+            try {
+                nextResolvedImports = processSingleFile(self, stackTop.filename, stackTop.source, options);
+            } catch (err) {
+                // Stop immediently if something fails to parse
                 finish(err);
                 return;
             }
 
-            if (source) {
-                var nextResolvedImports;
-                try {
-                    nextResolvedImports = processSingleFile(self, resolvedFilename, source, options);
-                } catch (err) {
-                    // Stop immediently if something fails to parse
-                    if (!weak) {
-                        finish(err);
-                        return;
-                    }
-                }
-
-                // Dispatch imports recursively
-                for (var i = 0; i < nextResolvedImports.length; i++) {
-                    var importItem = nextResolvedImports[i];
-                    handleOneFile(importItem.filename, importItem.weak);
-                }
+            // Dispatch import requests (backwards)
+            var j = nextResolvedImports.length;
+            while (j--) {
+                var importItem = nextResolvedImports[j];
+                fetchOneFile(importItem.filename, importItem.weak);
             }
+        }
 
-            // If all the imports are processed and all the inflight requests are done, then the callback will be called
-            finish(null);
-        });
+        // We're done if we emptied the stack
+        finish(null);
     }
 
-    if (util.isString(filename))
-        filename = [ filename ];
 
-    // Resolve and fetch initial files
-    for (var i = 0; i < filename.length; ++i) {
+    // Resolve and fetch initial files (backwards)
+    filename = util.isString(filename) ? [filename] : filename;
+    var i = filename.length;
+    while (i--) {
         const resolvedFilename = getBundledFileName(filename[i]) || self.resolvePath("", filename[i]);
         if (resolvedFilename !== null)
-            handleOneFile(resolvedFilename, false);
+            fetchOneFile(resolvedFilename, false);
     }
 
-    // Call the callback immediently if there is nothing to load
-    finish(null);
+    // Special case for empty list
+    if (stack.length === 0)
+        finish(null);
+
     return undefined;
 };
 // function load(filename:string, options:IParseOptions, callback:LoadCallback):undefined
@@ -271,11 +301,13 @@ Root.prototype.loadSync = function loadSync(filename, options) {
     if (!util.isNode)
         throw Error("not supported");
 
-    var self = this,
-        stack = [];
-    filename = util.isString(filename) ? [filename] : filename;
+    var self = this;
+
+    // Stack of work containing { filename: string, weak: boolean }
+    var stack = [];
 
     // Resolve initial files and append to stack (backwards)
+    filename = util.isString(filename) ? [filename] : filename;
     var i = filename.length;
     while (i--) {
         const resolvedFilename = getBundledFileName(filename[i]) || self.resolvePath("", filename[i]);
