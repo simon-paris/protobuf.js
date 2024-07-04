@@ -133,7 +133,7 @@ function decoder(mtype) {
                     ("%s.push(r.%s())", ref, type)
                     ("break")
                 ("}");
-            }
+            } // <- No else here, always generate code for both packed and unpacked encodings
 
             if (types.packed[type] !== undefined) {
                 // Packed fields
